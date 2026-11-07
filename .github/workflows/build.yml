@@ -1,0 +1,248 @@
+name: Build Sesame-AG (Unencrypted)
+
+on:
+  schedule:
+    # 每天北京时间 03:00 自动检查上游更新
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '上游 Sesame-AG Tag（例如 4380-0.2.6，留空自动拉取最新 Release Tag）'
+        required: false
+        default: '4380-0.2.6'
+      force:
+        description: '即使该版本已存在 Release 是否强制重新构建'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  CI: "true"
+  JAVA_DISTRIBUTION: "oracle"
+  JAVA_VERSION: "17.0.1"
+  ANDROID_API_LEVEL: "37"
+  ANDROID_PLATFORM: "android-37.0"
+  ANDROID_BUILD_TOOLS: "37.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set Timezone to Asia/Shanghai
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timedatectl set-timezone Asia/Shanghai
+          echo "Current time: $(date)"
+
+      - name: Resolve Target Tag
+        id: resolve_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT_TAG="${{ inputs.tag }}"
+          if [[ -n "${INPUT_TAG}" ]]; then
+            TARGET_TAG="${INPUT_TAG}"
+          else
+            echo "Fetching latest tag from Sesame-AG/Sesame-AG..."
+            LATEST_TAG=$(curl -s "https://api.github.com/repos/Sesame-AG/Sesame-AG/tags" | jq -r '.[].name' | grep -E '^[0-9]+-' | head -n1)
+            if [[ -z "${LATEST_TAG}" ]]; then
+              echo "Failed to resolve latest tag from Sesame-AG" >&2
+              exit 1
+            fi
+            TARGET_TAG="${LATEST_TAG}"
+          fi
+          echo "target_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Selected Target Tag: ${TARGET_TAG}"
+
+      - name: Check Existing Release
+        id: check_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ steps.resolve_tag.outputs.target_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [[ "${FORCE}" == "true" ]]; then
+            echo "Force build requested, proceeding."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TARGET_TAG} already exists in ${GITHUB_REPOSITORY}. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release does not exist. Proceeding with build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout Sesame-AG Source Code
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: 'Sesame-AG/Sesame-AG'
+          ref: ${{ steps.resolve_tag.outputs.target_tag }}
+          fetch-depth: 0
+
+      - name: Set up JDK
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          architecture: x64
+          check-latest: false
+          cache: gradle
+
+      - name: Pin Gradle Java Home
+        if: steps.check_release.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ORG_GRADLE_JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        if: steps.check_release.outputs.skip != 'true'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Android SDK Packages
+        if: steps.check_release.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: Set up Gradle
+        if: steps.check_release.outputs.skip != 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-version: wrapper
+
+      - name: Grant execute permission for gradlew
+        if: steps.check_release.outputs.skip != 'true'
+        run: chmod +x gradlew
+
+      - name: Build Release APKs
+        if: steps.check_release.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Sign APKs with Generated Keystore
+        if: steps.check_release.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          android_sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          apksigner_path="${android_sdk_root}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+
+          # 生成标准自签名 Release 证书
+          keytool -genkeypair -v \
+            -keystore release.jks \
+            -alias sesame \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "123456" \
+            -keypass "123456" \
+            -dname "CN=Sesame-AG, OU=Build, O=Build, L=Shanghai, S=Shanghai, C=CN"
+
+          mkdir -p signed_apks
+          for apk in app/build/outputs/apk/release/*.apk; do
+            [[ -f "$apk" ]] || continue
+            filename=$(basename "$apk")
+            signed_apk="signed_apks/${filename}"
+            cp "$apk" "${signed_apk}"
+            echo "Signing ${filename} with apksigner (v1 + v2 + v3)..."
+            "${apksigner_path}" sign \
+              --ks release.jks \
+              --ks-key-alias sesame \
+              --ks-pass pass:123456 \
+              --key-pass pass:123456 \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              "${signed_apk}"
+            "${apksigner_path}" verify --verbose "${signed_apk}"
+          done
+
+      - name: Prepare Unencrypted Assets
+        if: steps.check_release.outputs.skip != 'true'
+        id: prepare_assets
+        shell: bash
+        env:
+          TARGET_TAG: ${{ steps.resolve_tag.outputs.target_tag }}
+        run: |
+          set -euo pipefail
+          DIST_DIR="dist"
+          mkdir -p "${DIST_DIR}"
+          cp signed_apks/*.apk "${DIST_DIR}/"
+
+          (
+            cd "${DIST_DIR}"
+            for apk in *.apk; do
+              sha256sum "$apk" > "CHECKSUMS-${apk}.sha256"
+            done
+            sha256sum -- *.apk > SHA256SUMS
+          )
+
+          # 打包无密码 ZIP 压缩包
+          ZIP_NAME="Sesame-AG-${TARGET_TAG}.zip"
+          (
+            cd "${DIST_DIR}"
+            zip -r "${ZIP_NAME}" .
+          )
+
+          echo "dist_dir=${DIST_DIR}" >> "$GITHUB_OUTPUT"
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          ls -lh "${DIST_DIR}"
+
+      - name: Upload Artifacts
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sesame-AG-${{ steps.resolve_tag.outputs.target_tag }}
+          path: ${{ steps.prepare_assets.outputs.dist_dir }}/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.check_release.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve_tag.outputs.target_tag }}
+          name: Sesame-AG ${{ steps.resolve_tag.outputs.target_tag }} (免密版)
+          files: |
+            ${{ steps.prepare_assets.outputs.dist_dir }}/*
+          draft: false
+          prerelease: false
+          make_latest: true
+          body: |
+            ### Sesame-AG 自动免密构建版本
+
+            - **对应官方版本 / Tag**：`${{ steps.resolve_tag.outputs.target_tag }}`
+            - **上游代码仓库**：[Sesame-AG/Sesame-AG](https://github.com/Sesame-AG/Sesame-AG)
+            - **解压密码**：**无密码（原生已签名 APK，直接下载安装即可）**
+
+            #### 架构说明
+            - **arm64-v8a**: 适用于现代 64 位 Android 手机（主流）
+            - **armeabi-v7a**: 适用于老旧 32 位 Android 设备
+            - **x86 / x86_64**: 适用于 PC 安卓模拟器
+            - **universal**: 通用版（体积较大，如不确定机型可下载此版本）
+            - **Sesame-AG-${{ steps.resolve_tag.outputs.target_tag }}.zip**: 包含所有 APK 与校验和的完整压缩包（**无解压密码**）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
