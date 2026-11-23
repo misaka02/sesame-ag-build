@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '上游 Sesame-AG Tag（例如 4380-0.2.6，留空自动拉取最新 Release Tag）'
+        description: '上游 Sesame-AG Tag（例如 4400-0.2.7，留空自动拉取最新 Release Tag）'
         required: false
-        default: '4380-0.2.6'
+        default: ''
       force:
         description: '即使该版本已存在 Release 是否强制重新构建'
         required: false
@@ -181,6 +181,155 @@ jobs:
             "${apksigner_path}" verify --verbose "${signed_apk}"
           done
 
+      - name: Generate Release Notes
+        if: steps.check_release.outputs.skip != 'true'
+        id: release_notes
+        shell: bash
+        env:
+          TARGET_TAG: ${{ steps.resolve_tag.outputs.target_tag }}
+          UPSTREAM_REPO: Sesame-AG/Sesame-AG
+        run: |
+          set -euo pipefail
+
+          body_path="${RUNNER_TEMP}/release-body.md"
+          head_sha="$(git rev-parse HEAD)"
+          tag_object_type="$(git cat-file -t "refs/tags/${TARGET_TAG}" 2>/dev/null || true)"
+          tag_notes=""
+          prev_tag="$(git describe --tags --abbrev=0 "${head_sha}^" 2>/dev/null || true)"
+          commit_history_url="https://github.com/${UPSTREAM_REPO}/commits/${TARGET_TAG}"
+          compare_url=""
+          commit_range_display="首次发布（完整历史）"
+          range_args=("${head_sha}")
+          excluded_type_regex='^(docs|style|ci|test|build)(\([^)]*\))?[!]?:[[:space:]]+'
+          commit_type_regex='^([[:alpha:]]+)(\([^)]*\))?[!]?:[[:space:]]+'
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "${tmp_dir}"' EXIT
+
+          categories=(feat fix perf refactor revert other)
+          declare -A category_titles=(
+            [feat]="新功能"
+            [fix]="问题修复"
+            [perf]="性能优化"
+            [refactor]="重构调整"
+            [revert]="回滚变更"
+            [other]="其他更新"
+          )
+
+          for category in "${categories[@]}"; do
+            : > "${tmp_dir}/${category}.md"
+          done
+
+          if [[ "${tag_object_type}" == "tag" ]]; then
+            tag_notes="$(git for-each-ref "refs/tags/${TARGET_TAG}" --format='%(contents)')"
+          fi
+
+          if [[ -n "${prev_tag}" ]]; then
+            compare_url="https://github.com/${UPSTREAM_REPO}/compare/${prev_tag}...${TARGET_TAG}"
+            commit_range_display="${prev_tag}...${TARGET_TAG}"
+            range_args=("${prev_tag}..${head_sha}")
+          fi
+
+          declare -A seen_author=()
+          contributor_names=()
+          relevant_commit_count=0
+
+          while IFS=$'\t' read -r commit_sha commit_subject author_name author_email; do
+            [[ -n "${commit_sha}" ]] || continue
+
+            author_key="${author_name}|${author_email,,}"
+            if [[ -z "${seen_author[$author_key]+x}" ]]; then
+              seen_author[$author_key]=1
+              contributor_names+=("${author_name}")
+            fi
+
+            if [[ "${commit_subject}" =~ ${excluded_type_regex} ]]; then
+              continue
+            fi
+
+            category="other"
+            if [[ "${commit_subject}" =~ ${commit_type_regex} ]]; then
+              commit_type="${BASH_REMATCH[1],,}"
+              case "${commit_type}" in
+                feat|fix|perf|refactor|revert)
+                  category="${commit_type}"
+                  ;;
+                docs|style|ci|test|build)
+                  continue
+                  ;;
+              esac
+            fi
+
+            relevant_commit_count=$((relevant_commit_count + 1))
+            short_sha="${commit_sha:0:7}"
+            printf -- "- %s ([%s](https://github.com/%s/commit/%s))\n" \
+              "${commit_subject}" \
+              "${short_sha}" \
+              "${UPSTREAM_REPO}" \
+              "${commit_sha}" \
+              >> "${tmp_dir}/${category}.md"
+          done < <(git log --reverse --format='%H%x09%s%x09%an%x09%ae' "${range_args[@]}")
+
+          {
+            echo "### Sesame-AG 自动免密构建版本"
+            echo
+            echo "- **对应官方版本 / Tag**：\`${TARGET_TAG}\`"
+            echo "- **上游代码仓库**：[${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO})"
+            echo "- **变更范围**：\`${commit_range_display}\`"
+            echo "- **解压密码**：**无密码（原生已签名 APK，直接下载安装即可）**"
+            echo
+
+            if [[ -n "${tag_notes//[[:space:]]/}" ]]; then
+              echo "## 发布备注"
+              echo
+              echo "${tag_notes}"
+              echo
+            fi
+
+            if [[ ${relevant_commit_count} -gt 0 ]]; then
+              echo "## 更新日志"
+              echo
+              for category in "${categories[@]}"; do
+                if [[ -s "${tmp_dir}/${category}.md" ]]; then
+                  echo "### ${category_titles[$category]}"
+                  echo
+                  cat "${tmp_dir}/${category}.md"
+                  echo
+                fi
+              done
+            fi
+
+            if [[ ${#contributor_names[@]} -gt 0 ]]; then
+              echo "## 本轮贡献者"
+              echo
+              joined_contributors=""
+              for contributor_name in "${contributor_names[@]}"; do
+                if [[ -n "${joined_contributors}" ]]; then
+                  joined_contributors+="、"
+                fi
+                joined_contributors+="${contributor_name}"
+              done
+              echo "感谢以下参与本轮更新提交的开发者：${joined_contributors}"
+              echo
+            fi
+
+            echo "## Full Changelog"
+            echo
+            if [[ -n "${compare_url}" ]]; then
+              echo "- 对比视图：${compare_url}"
+            fi
+            echo "- 提交历史：${commit_history_url}"
+            echo
+
+            echo "> ## 下载说明"
+            echo "> - **arm64-v8a**: 适用于 64 位 ARM 设备 (主流新手机)"
+            echo "> - **armeabi-v7a**: 适用于 32 位 ARM 设备 (旧款手机)"
+            echo "> - **x86 / x86_64**: 主要用于 PC 上的安卓模拟器"
+            echo "> - **universal**: 通用版 (包含全部架构原生库)"
+            echo "> - **Sesame-AG-${TARGET_TAG}.zip**: 包含所有 APK、校验和与更新日志的完整压缩包（**无解压密码**）"
+          } > "${body_path}"
+
+          echo "body_path=${body_path}" >> "$GITHUB_OUTPUT"
+
       - name: Prepare Unencrypted Assets
         if: steps.check_release.outputs.skip != 'true'
         id: prepare_assets
@@ -192,6 +341,7 @@ jobs:
           DIST_DIR="dist"
           mkdir -p "${DIST_DIR}"
           cp signed_apks/*.apk "${DIST_DIR}/"
+          cp "${{ steps.release_notes.outputs.body_path }}" "${DIST_DIR}/RELEASE_NOTES-${TARGET_TAG}.md"
 
           (
             cd "${DIST_DIR}"
@@ -231,18 +381,6 @@ jobs:
           draft: false
           prerelease: false
           make_latest: true
-          body: |
-            ### Sesame-AG 自动免密构建版本
-
-            - **对应官方版本 / Tag**：`${{ steps.resolve_tag.outputs.target_tag }}`
-            - **上游代码仓库**：[Sesame-AG/Sesame-AG](https://github.com/Sesame-AG/Sesame-AG)
-            - **解压密码**：**无密码（原生已签名 APK，直接下载安装即可）**
-
-            #### 架构说明
-            - **arm64-v8a**: 适用于现代 64 位 Android 手机（主流）
-            - **armeabi-v7a**: 适用于老旧 32 位 Android 设备
-            - **x86 / x86_64**: 适用于 PC 安卓模拟器
-            - **universal**: 通用版（体积较大，如不确定机型可下载此版本）
-            - **Sesame-AG-${{ steps.resolve_tag.outputs.target_tag }}.zip**: 包含所有 APK 与校验和的完整压缩包（**无解压密码**）
+          body_path: ${{ steps.release_notes.outputs.body_path }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
